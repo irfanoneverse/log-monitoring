@@ -1,6 +1,8 @@
 # LGTM Observability Stack — Production Implementation Guide
 
-A complete, production-ready centralized observability platform using **Loki** (logs), **Grafana** (visualization), **Tempo** (traces), and **Mimir** (metrics), with **Grafana Alloy** as the collector agent on each application node.
+A complete, production-ready centralized observability platform using **Loki** (logs), **Grafana** (visualization), **Tempo** (traces), and **Mimir** (metrics), with **Grafana Alloy** as the unified collector agent on each application node.
+
+> **Gold Standard Approach**: This setup uses Alloy's **built-in exporters** instead of standalone binaries, and **OpenTelemetry auto-instrumentation** for deep request-level tracing. Zero extra systemd services beyond Alloy itself.
 
 ## Architecture Overview
 
@@ -8,28 +10,37 @@ A complete, production-ready centralized observability platform using **Loki** (
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         AWS VPC (Private Subnet)                    │
 │                                                                     │
-│  ┌─────────────┐  ┌─────────────┐       ┌─────────────┐            │
-│  │ Laravel EC2  │  │ Laravel EC2  │ ...  │ Laravel EC2  │  (×6)     │
-│  │             │  │             │       │             │            │
-│  │ ┌─────────┐ │  │ ┌─────────┐ │       │ ┌─────────┐ │            │
-│  │ │  Alloy  │ │  │ │  Alloy  │ │       │ │  Alloy  │ │            │
-│  │ └────┬────┘ │  │ └────┬────┘ │       │ └────┬────┘ │            │
-│  └──────┼──────┘  └──────┼──────┘       └──────┼──────┘            │
-│         │                │                      │                   │
-│         └────────────────┼──────────────────────┘                   │
-│                          │  Private Network                         │
-│                          ▼                                          │
-│              ┌───────────────────────┐                              │
-│              │   LGTM Server EC2     │                              │
-│              │                       │                              │
-│              │  ┌─────┐ ┌─────────┐  │                              │
-│              │  │Loki │ │ Grafana │  │                              │
-│              │  ├─────┤ ├─────────┤  │     ┌──────────┐            │
-│              │  │Mimir│ │  Tempo  │──┼────▶│  AWS S3  │            │
-│              │  └─────┘ └─────────┘  │     └──────────┘            │
-│              └───────────────────────┘                              │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
+│  │   Laravel EC2     │  │   Laravel EC2     │  │   Laravel EC2    │  │
+│  │                   │  │                   │  │                  │  │
+│  │  ┌──────────────┐ │  │  ┌──────────────┐ │  │ ┌──────────────┐│  │
+│  │  │ Grafana Alloy│ │  │  │ Grafana Alloy│ │  │ │ Grafana Alloy││  │
+│  │  │              │ │  │  │              │ │  │ │              ││  │
+│  │  │ • unix exporter│  │  │ • unix exporter│  │ │ • unix exporter│  │
+│  │  │ • nginx exporter│ │  │ • nginx exporter│ │ │ • nginx exporter│ │
+│  │  │ • phpfpm exporter│ │ │ • phpfpm exporter│ │ • phpfpm exporter│ │
+│  │  │ • OTLP receiver│ │  │ • OTLP receiver│ │ │ • OTLP receiver││  │
+│  │  │ • log tailing │ │  │  │ • log tailing │ │  │ │ • log tailing ││  │
+│  │  └──────┬───────┘ │  │  └──────┬───────┘ │  │ └──────┬───────┘│  │
+│  │         │ OTel PHP │  │         │ OTel PHP │  │        │ OTel PHP│  │
+│  └─────────┼─────────┘  └─────────┼─────────┘  └────────┼────────┘  │
+│            │                      │                      │           │
+│            └──────────────────────┼──────────────────────┘           │
+│                                   │  Private Network                 │
+│                                   ▼                                  │
+│               ┌───────────────────────────┐                          │
+│               │     LGTM Server EC2       │                          │
+│               │                           │                          │
+│               │  ┌─────┐   ┌───────────┐  │                          │
+│               │  │Loki │   │  Grafana  │  │                          │
+│               │  ├─────┤   ├───────────┤  │     ┌──────────┐        │
+│               │  │Mimir│   │   Tempo   │──┼────▶│  AWS S3  │        │
+│               │  └─────┘   └───────────┘  │     └──────────┘        │
+│               └───────────────────────────┘                          │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+**Key difference from traditional setups**: Alloy is the **only process** you install. It replaces Node Exporter, Nginx Exporter, and PHP-FPM Exporter with built-in equivalents, while also collecting logs and forwarding traces.
 
 ---
 
@@ -39,9 +50,10 @@ A complete, production-ready centralized observability platform using **Loki** (
 2. [S3 Lifecycle Policy](#2-s3-lifecycle-policy)
 3. [LGTM Server EC2 Setup](#3-lgtm-server-ec2-setup)
 4. [Grafana Alloy Setup (Laravel EC2s)](#4-grafana-alloy-setup-on-each-laravel-ec2)
-5. [Grafana Configuration](#5-grafana-configuration)
-6. [Security & Networking](#6-security--networking)
-7. [Verification & Testing](#7-verification--testing)
+5. [Laravel Application Integration](#5-laravel-application-integration)
+6. [Grafana Configuration](#6-grafana-configuration)
+7. [Security & Networking](#7-security--networking)
+8. [Verification & Testing](#8-verification--testing)
 
 ---
 
@@ -266,7 +278,6 @@ exit
 
 ```bash
 # Clone or copy this repo to the server
-# (or scp the lgtm-server/ directory)
 cd /opt
 sudo mkdir -p lgtm && sudo chown $USER:$USER lgtm
 git clone <your-repo-url> lgtm
@@ -327,47 +338,13 @@ sudo apt install -y alloy
 alloy --version
 ```
 
-### 4.2 Install Metric Exporters
+### 4.2 Enable Nginx & PHP-FPM Status Endpoints
 
-Alloy scrapes these local exporters. Install them on each Laravel EC2:
+Alloy's built-in exporters need these status pages to scrape metrics from. **No separate exporter binaries are installed.**
 
-#### Node Exporter (system metrics: CPU, RAM, disk, network)
-
-```bash
-# Download and install
-cd /tmp
-wget https://github.com/prometheus/node_exporter/releases/download/v1.8.2/node_exporter-1.8.2.linux-amd64.tar.gz
-tar xzf node_exporter-1.8.2.linux-amd64.tar.gz
-sudo mv node_exporter-1.8.2.linux-amd64/node_exporter /usr/local/bin/
-
-# Create systemd service
-sudo tee /etc/systemd/system/node_exporter.service << 'EOF'
-[Unit]
-Description=Prometheus Node Exporter
-After=network.target
-
-[Service]
-Type=simple
-User=nobody
-ExecStart=/usr/local/bin/node_exporter
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now node_exporter
-
-# Verify: should return metrics
-curl -s http://localhost:9100/metrics | head -5
-```
-
-#### Nginx Exporter
+#### Nginx `stub_status` (required for Nginx metrics)
 
 ```bash
-# Step 1: Enable Nginx stub_status (required)
 sudo tee /etc/nginx/conf.d/stub_status.conf << 'EOF'
 server {
     listen 8080;
@@ -381,47 +358,18 @@ server {
 EOF
 sudo nginx -t && sudo systemctl reload nginx
 
-# Step 2: Install the exporter
-cd /tmp
-wget https://github.com/nginxinc/nginx-prometheus-exporter/releases/download/v1.4.0/nginx-prometheus-exporter_1.4.0_linux_amd64.tar.gz
-tar xzf nginx-prometheus-exporter_1.4.0_linux_amd64.tar.gz
-sudo mv nginx-prometheus-exporter /usr/local/bin/
-
-# Create systemd service
-sudo tee /etc/systemd/system/nginx_exporter.service << 'EOF'
-[Unit]
-Description=Nginx Prometheus Exporter
-After=nginx.service
-
-[Service]
-Type=simple
-User=nobody
-ExecStart=/usr/local/bin/nginx-prometheus-exporter --nginx.scrape-uri=http://127.0.0.1:8080/nginx_status
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now nginx_exporter
-
-# Verify
-curl -s http://localhost:9113/metrics | head -5
+# Verify: should return Active connections, accepts, handled, requests
+curl -s http://127.0.0.1:8080/nginx_status
 ```
 
-#### PHP-FPM Exporter
+#### PHP-FPM Status Page (required for PHP-FPM metrics)
 
 ```bash
-# Step 1: Enable PHP-FPM status page
-# Edit your PHP-FPM pool config (e.g., /etc/php/8.3/fpm/pool.d/www.conf)
-# Uncomment or add:
-#   pm.status_path = /status
+# Enable the status path in PHP-FPM pool config
 sudo sed -i 's/;pm.status_path = \/status/pm.status_path = \/status/' /etc/php/*/fpm/pool.d/www.conf
 sudo systemctl restart php*-fpm
 
-# Step 2: Add Nginx location for PHP-FPM status
+# Add Nginx location block to proxy the status page
 sudo tee -a /etc/nginx/conf.d/stub_status.conf << 'EOF'
 
     location /fpm-status {
@@ -434,35 +382,11 @@ sudo tee -a /etc/nginx/conf.d/stub_status.conf << 'EOF'
 EOF
 sudo nginx -t && sudo systemctl reload nginx
 
-# Step 3: Install the exporter
-cd /tmp
-wget https://github.com/hipages/php-fpm_exporter/releases/download/v2.2.0/php-fpm_exporter_2.2.0_linux_amd64.tar.gz
-tar xzf php-fpm_exporter_2.2.0_linux_amd64.tar.gz
-sudo mv php-fpm_exporter /usr/local/bin/
-
-# Create systemd service
-sudo tee /etc/systemd/system/phpfpm_exporter.service << 'EOF'
-[Unit]
-Description=PHP-FPM Prometheus Exporter
-After=php8.3-fpm.service
-
-[Service]
-Type=simple
-User=nobody
-ExecStart=/usr/local/bin/php-fpm_exporter server --phpfpm.scrape-uri="tcp://127.0.0.1:80/fpm-status"
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now phpfpm_exporter
-
-# Verify
-curl -s http://localhost:9253/metrics | head -5
+# Verify: should return PHP-FPM pool status
+curl -s http://127.0.0.1:80/fpm-status
 ```
+
+> **What about Node Exporter?** You don't need it at all. Alloy's built-in `prometheus.exporter.unix` reads directly from Linux's `/proc` and `/sys` filesystems — same data, zero extra processes.
 
 ### 4.3 Deploy the Alloy Configuration
 
@@ -483,73 +407,80 @@ sudo systemctl status alloy
 sudo journalctl -u alloy -f --no-pager -n 50
 ```
 
-### 4.4 Laravel-Specific Considerations
+### 4.4 What Alloy Collects (No Extra Installation Needed)
 
-#### Log Format
+Alloy's configuration file handles everything with zero standalone exporters:
 
-Laravel's default log channel writes to `storage/logs/laravel.log` in this format:
+| What                          | Alloy Component               | Old Approach                       | Metrics                                                |
+| ----------------------------- | ----------------------------- | ---------------------------------- | ------------------------------------------------------ |
+| **System (CPU/RAM/Disk/Net)** | `prometheus.exporter.unix`    | Standalone Node Exporter binary    | `node_cpu_seconds_total`, `node_memory_*`, etc.        |
+| **Nginx**                     | `prometheus.exporter.nginx`   | Standalone Nginx Exporter binary   | `nginx_connections_*`, `nginx_http_requests_total`     |
+| **PHP-FPM**                   | `prometheus.exporter.php_fpm` | Standalone PHP-FPM Exporter binary | `phpfpm_active_processes`, `phpfpm_listen_queue`, etc. |
+| **Laravel Logs**              | `loki.source.file`            | Same ✓                             | Log lines → Loki                                       |
+| **Nginx/PHP-FPM Logs**        | `loki.source.file`            | Same ✓                             | Log lines → Loki                                       |
+| **Traces (OTLP)**             | `otelcol.receiver.otlp`       | Same ✓                             | Spans → Tempo                                          |
 
-```
-[2026-03-03 10:15:42] production.ERROR: Unauthenticated. {"exception":"..."}
-```
+> **Result**: Instead of managing 4 systemd services (Alloy + 3 exporters), you manage **just 1** (Alloy). Less maintenance, fewer failure points, and unified configuration.
 
-The Alloy config includes a regex stage that parses this format, extracting:
+---
 
-- `timestamp` — used to set the log entry's timestamp
-- `environment` — added as a Loki label (production, staging, etc.)
-- `level` — added as a Loki label (ERROR, WARNING, INFO, DEBUG)
+## 5. Laravel Application Integration
 
-#### Trace Correlation
+This is where the **gold standard** approach really shines — full OpenTelemetry tracing gives you request-level visibility that no exporter can provide.
 
-To enable **log ↔ trace** correlation in Grafana:
+### 5.1 Install OpenTelemetry (Tracing)
 
-1. Install the [Laravel OpenTelemetry package](https://github.com/open-telemetry/opentelemetry-php-contrib/tree/main/src/Instrumentation/Laravel):
+On each Laravel EC2, in the Laravel project directory:
 
 ```bash
+# Core OpenTelemetry SDK + OTLP exporter
 composer require open-telemetry/sdk \
   open-telemetry/exporter-otlp \
-  open-telemetry/opentelemetry-auto-laravel
+  open-telemetry/transport-grpc
+
+# Laravel auto-instrumentation (recommended)
+composer require keepsuit/laravel-opentelemetry
+
+# Publish the config
+php artisan vendor:publish --provider="Keepsuit\LaravelOpenTelemetry\LaravelOpenTelemetryServiceProvider"
 ```
 
-2. Configure the OTLP exporter in your Laravel `.env`:
+> **Why `keepsuit/laravel-opentelemetry`?** It auto-instruments HTTP requests, Eloquent queries, Redis calls, Queue jobs, and Artisan commands with **zero code changes**. This shows you exactly which database query or API call is slowing down a specific request — far more powerful than a simple PHP-FPM exporter.
+
+### 5.2 Configure OpenTelemetry Environment
+
+Add these to your Laravel `.env` file (reference: [`laravel/.env.otel.example`](laravel/.env.otel.example)):
 
 ```env
 OTEL_SERVICE_NAME=laravel-app-1
 OTEL_TRACES_EXPORTER=otlp
+OTEL_METRICS_EXPORTER=otlp
+OTEL_LOGS_EXPORTER=none
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 OTEL_PHP_AUTOLOAD_ENABLED=true
+OTEL_RESOURCE_ATTRIBUTES=deployment.environment=production,service.namespace=laravel
+OTEL_TRACES_SAMPLER=parentbased_traceidratio
+OTEL_TRACES_SAMPLER_ARG=1.0
 ```
 
-3. Add the trace ID to your log context by creating a middleware:
+| Variable                      | What it does                                                 |
+| ----------------------------- | ------------------------------------------------------------ |
+| `OTEL_SERVICE_NAME`           | Identifies this instance in Tempo (change per EC2)           |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Points to Alloy's local OTLP receiver                        |
+| `OTEL_LOGS_EXPORTER=none`     | Logs go via Alloy file tailing, not OTLP                     |
+| `OTEL_TRACES_SAMPLER_ARG`     | `1.0` = 100% of requests traced. Lower for high-traffic apps |
 
-```php
-// app/Http/Middleware/TraceIdMiddleware.php
-<?php
+### 5.3 Install TraceId Middleware (Log ↔ Trace Correlation)
 
-namespace App\Http\Middleware;
+This middleware injects the trace ID into every log entry, enabling one-click navigation from a log line in Loki to its full trace waterfall in Tempo.
 
-use Closure;
-use Illuminate\Http\Request;
-use OpenTelemetry\API\Trace\Span;
-
-class TraceIdMiddleware
-{
-    public function handle(Request $request, Closure $next)
-    {
-        $traceId = Span::getCurrent()->getContext()->getTraceId();
-
-        if ($traceId) {
-            // Add traceId to all log entries in this request
-            app('log')->shareContext(['traceId' => $traceId]);
-        }
-
-        return $next($request);
-    }
-}
+```bash
+# Copy the reference middleware
+cp laravel/TraceIdMiddleware.php /var/www/html/app/Http/Middleware/TraceIdMiddleware.php
 ```
 
-4. Register the middleware in your `bootstrap/app.php` (Laravel 11+):
+Register it in `bootstrap/app.php` (Laravel 11+):
 
 ```php
 ->withMiddleware(function (Middleware $middleware) {
@@ -557,11 +488,47 @@ class TraceIdMiddleware
 })
 ```
 
+Or for Laravel 10, add to `$middleware` in `app/Http/Kernel.php`:
+
+```php
+protected $middleware = [
+    // ... existing middleware
+    \App\Http\Middleware\TraceIdMiddleware::class,
+];
+```
+
+### 5.4 What You Get from OpenTelemetry
+
+After setup, Grafana's **Explore → Tempo** shows full request waterfalls:
+
+```
+HTTP GET /api/orders  [245ms]
+├─ middleware.handle   [2ms]
+├─ eloquent.query      [180ms]  ← "SELECT * FROM orders WHERE..."
+│   └─ db.connect      [5ms]
+├─ redis.get           [8ms]   ← Cache lookup
+└─ http.response       [1ms]
+```
+
+This is **dramatically more useful** than a PHP-FPM exporter metric like "5 active processes" — you can see exactly _why_ a request is slow.
+
+### 5.5 (Optional) Application-Level Metrics
+
+For business metrics (e.g., "orders processed per minute", "failed payments"), expose a Prometheus endpoint:
+
+```bash
+composer require promphp/prometheus_client_php
+```
+
+Or push metrics via OTLP — Alloy's OTLP receiver already accepts metrics and forwards them to Mimir.
+
+> See [`laravel/README.md`](laravel/README.md) for the complete Laravel integration guide.
+
 ---
 
-## 5. Grafana Configuration
+## 6. Grafana Configuration
 
-### 5.1 Datasources
+### 6.1 Datasources
 
 Datasources are **auto-provisioned** when Grafana starts. The provisioning file at `grafana/provisioning/datasources/datasources.yaml` configures:
 
@@ -571,7 +538,7 @@ Datasources are **auto-provisioned** when Grafana starts. The provisioning file 
 | **Loki**   | Loki       | `http://loki:3100`             | Derived field → Tempo trace lookup |
 | **Tempo**  | Tempo      | `http://tempo:3200`            | Service map, trace → log/metrics   |
 
-### 5.2 Cross-Signal Correlation
+### 6.2 Cross-Signal Correlation
 
 The provisioning config enables powerful cross-correlation:
 
@@ -587,21 +554,19 @@ Logs (Loki) ←──── traceId ────→ Traces (Tempo)
 - **Tempo → Loki**: From any trace span, filter Loki logs by trace ID.
 - **Tempo → Mimir**: Service graph topology and RED metrics auto-generated.
 
-### 5.3 Recommended Dashboards
+### 6.3 Recommended Dashboards
 
 Import these community dashboards via **Grafana UI → Dashboards → Import**:
 
 | Dashboard                    | Grafana ID | What it shows                                |
 | ---------------------------- | ---------- | -------------------------------------------- |
 | Node Exporter Full           | `1860`     | CPU, memory, disk, network per host          |
-| Nginx Overview               | `12708`    | Requests, connections, response codes        |
-| PHP-FPM Overview             | `4912`     | Active processes, slow requests, queue       |
 | Loki Dashboard (logs volume) | `13639`    | Log ingestion rate, error rates, top sources |
 | Mimir / Prometheus Overview  | `3662`     | Metric ingestion, query performance          |
 
-#### Custom Laravel Dashboard (create manually)
+> **Note on dashboard compatibility**: Alloy's `prometheus.exporter.unix` emits the same `node_*` metrics as standalone Node Exporter, so dashboard `1860` works without changes. Nginx and PHP-FPM metric names are also compatible.
 
-Create a dashboard with these panels:
+#### Custom Laravel Dashboard (create manually)
 
 | Panel Title                 | Query Type | Query                                                                                                    |
 | --------------------------- | ---------- | -------------------------------------------------------------------------------------------------------- |
@@ -615,12 +580,16 @@ Create a dashboard with these panels:
 | Recent Errors (Log Panel)   | Loki       | `{job="laravel", level="ERROR"}`                                                                         |
 | Laravel Log Volume by Level | Loki       | `sum by(level)(rate({job="laravel"}[5m]))`                                                               |
 | Service Graph               | Tempo      | Use the built-in Service Graph / Node Graph panel                                                        |
+| Request Latency (p95)       | Mimir      | `histogram_quantile(0.95, sum(rate(traces_spanmetrics_latency_bucket[5m])) by (le, service))`            |
+| Error Rate by Service       | Mimir      | `sum(rate(traces_spanmetrics_calls_total{status_code="STATUS_CODE_ERROR"}[5m])) by (service)`            |
+
+> The last two panels use **Tempo's metrics generator** — it automatically creates RED metrics from traces and pushes them to Mimir. No extra config needed.
 
 ---
 
-## 6. Security & Networking
+## 7. Security & Networking
 
-### 6.1 Network Topology
+### 7.1 Network Topology
 
 All communication is over the **AWS VPC private network**. No observability traffic traverses the public internet.
 
@@ -637,7 +606,7 @@ Laravel EC2 (10.0.1.15)  ──┘
 - **Alloy → Mimir**: HTTP push to `http://10.0.1.50:9009`
 - **Alloy → Tempo**: OTLP HTTP push to `http://10.0.1.50:4318`
 
-### 6.2 DNS vs Load Balancer
+### 7.2 DNS vs Load Balancer
 
 | Option                              | When to use                                        |
 | ----------------------------------- | -------------------------------------------------- |
@@ -673,7 +642,7 @@ aws route53 change-resource-record-sets \
 
 Then in Alloy configs, use `lgtm.internal.yourcompany.com` instead of the IP.
 
-### 6.3 TLS / Authentication
+### 7.3 TLS / Authentication
 
 For a **private VPC** deployment with security groups:
 
@@ -694,9 +663,9 @@ For a **private VPC** deployment with security groups:
 
 ---
 
-## 7. Verification & Testing
+## 8. Verification & Testing
 
-### 7.1 Verify LGTM Stack Health
+### 8.1 Verify LGTM Stack Health
 
 After `docker compose up -d`, check each component:
 
@@ -728,7 +697,7 @@ curl -s http://localhost:3000/api/health
 # Expected: {"commit":"...","database":"ok","version":"..."}
 ```
 
-### 7.2 Verify Alloy on Laravel EC2s
+### 8.2 Verify Alloy on Laravel EC2s
 
 ```bash
 # Check Alloy service status
@@ -742,7 +711,7 @@ curl -s http://localhost:12345/ready
 # Expected: "ready"
 ```
 
-### 7.3 Verify Data Flow
+### 8.3 Verify Data Flow
 
 #### Logs (Loki)
 
@@ -771,7 +740,7 @@ curl -s "http://localhost:3200/api/search?limit=5" | jq .
 # Or use Grafana: navigate to Explore → Tempo → Search
 ```
 
-### 7.4 End-to-End Smoke Test
+### 8.4 End-to-End Smoke Test
 
 Run this from any Laravel EC2 to generate test data:
 
@@ -809,7 +778,7 @@ curl -X POST http://localhost:4318/v1/traces \
 # 3. Explore → Mimir → query "up" → should see all 6 instances
 ```
 
-### 7.5 Basic Alerting Setup
+### 8.5 Basic Alerting Setup
 
 Create alert rules in Grafana for common scenarios:
 
@@ -836,12 +805,14 @@ Create alert rules in Grafana for common scenarios:
 3. **Evaluation**: Every 5m, for 10m
 4. **Labels**: `severity = warning`
 
-#### Alert: PHP-FPM Queue Building Up
+#### Alert: High Request Latency (from Traces)
 
-1. **Query** (Mimir): `phpfpm_listen_queue > 10`
-2. **Condition**: Is above `10`
+1. **Query** (Mimir): `histogram_quantile(0.95, sum(rate(traces_spanmetrics_latency_bucket[5m])) by (le)) > 2`
+2. **Condition**: p95 latency above 2 seconds
 3. **Evaluation**: Every 1m, for 5m
 4. **Labels**: `severity = warning`
+
+> This alert uses Tempo's metrics generator — it automatically creates latency histograms from trace data. No PHP-FPM exporter needed.
 
 #### Alert: High Laravel Error Logs
 
@@ -870,8 +841,12 @@ log-monitoring/
 │       └── provisioning/
 │           └── datasources/
 │               └── datasources.yaml   ← Auto-provisioned datasources
-└── alloy/
-    └── config.alloy                   ← Alloy config for Laravel nodes
+├── alloy/
+│   └── config.alloy                   ← Alloy config (built-in exporters, no standalone binaries)
+└── laravel/
+    ├── README.md                      ← Laravel integration guide
+    ├── TraceIdMiddleware.php           ← Reference: log↔trace correlation middleware
+    └── .env.otel.example              ← Reference: OpenTelemetry .env variables
 ```
 
 ---
@@ -886,11 +861,16 @@ log-monitoring/
 - [ ] `docker compose up -d` — all services healthy
 - [ ] Grafana accessible at `http://<LGTM-IP>:3000`
 - [ ] Alloy installed on all 6 Laravel EC2 instances
-- [ ] Node Exporter, Nginx Exporter, PHP-FPM Exporter installed on each Laravel EC2
+- [ ] Nginx `stub_status` enabled on each Laravel EC2
+- [ ] PHP-FPM `pm.status_path` enabled on each Laravel EC2
 - [ ] Alloy config updated with correct LGTM server IP and unique instance names
-- [ ] Alloy service running on all 6 instances
+- [ ] Alloy service running on all 6 instances (single service — no standalone exporters)
+- [ ] OpenTelemetry packages installed in Laravel (`keepsuit/laravel-opentelemetry`)
+- [ ] `.env` updated with OTEL variables on each instance
+- [ ] TraceId middleware registered in Laravel
 - [ ] Logs visible in Grafana → Explore → Loki
 - [ ] Metrics visible in Grafana → Explore → Mimir
-- [ ] Traces visible in Grafana → Explore → Tempo
+- [ ] Traces visible in Grafana → Explore → Tempo (with request waterfalls)
+- [ ] Log ↔ Trace correlation working (click traceId in log → opens trace)
 - [ ] Alert rules created for critical scenarios
 - [ ] Grafana admin password changed from default
