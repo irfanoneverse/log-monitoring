@@ -6,7 +6,7 @@
 | Setting         | Value                                                                |
 | --------------- | -------------------------------------------------------------------- |
 | **Bucket type** | General purpose                                                      |
-| **Bucket name** | `bucket-name`                                                        |
+| **Bucket name** | `lgtm-bucket`                                                        |
 | **AWS Region**  | `Asia Pacific (Singapore) ap-southeast-1` (or your preferred region) |
 
 3. Block Public Access
@@ -41,8 +41,8 @@ Under **Default encryption**:
 "s3:GetBucketLocation"
 ],
 "Resource": [
-"arn:aws:s3:::bucket-name",
-"arn:aws:s3:::bucket-name/*"
+"arn:aws:s3:::lgtm-bucket",
+"arn:aws:s3:::lgtm-bucket/*"
 ]
 }
 ]
