@@ -1,0 +1,76 @@
+# =============================================================================
+# Docker Compose — Monitoring Agent Stack (Laravel App EC2)
+# =============================================================================
+# Deploys the observability agent (Grafana Alloy) as a Docker container
+# on each Laravel EC2 instance.
+#
+# WHAT THIS DOES:
+#   - Runs Alloy in Docker to collect logs, metrics, and traces
+#   - Leaves your Laravel app (Nginx, PHP-FPM) running natively via systemctl
+#   - If monitoring breaks: `docker compose down` — app is completely unaffected
+#
+# WHAT THIS DOES NOT DO:
+#   - Does NOT containerize Nginx, PHP-FPM, or your Laravel app
+#   - Does NOT require any changes to your application code
+#
+# PREREQUISITES:
+#   - Docker and Docker Compose installed on the Laravel EC2
+#   - Nginx stub_status enabled (port 8080)
+#   - PHP-FPM pm.status_path enabled
+#   - OpenTelemetry packages installed in Laravel (for traces)
+#
+# IMPORTANT: Before running, edit config.alloy to set:
+#   1. LGTM_SERVER_PRIVATE_IP → your LGTM server's private IP
+#   2. instance = "laravel-app-1" → unique name per EC2
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Grafana Alloy — Unified Collector Agent
+  # ---------------------------------------------------------------------------
+  # Collects logs, metrics (built-in exporters), and traces from the host.
+  # Uses host networking so it can access:
+  #   - Nginx stub_status on 127.0.0.1:8080
+  #   - PHP-FPM status on 127.0.0.1:80/fpm-status
+  #   - Host /proc and /sys for system metrics
+  #   - Laravel log files on the host filesystem
+  # ---------------------------------------------------------------------------
+  alloy:
+    image: grafana/alloy:v1.8.3
+    container_name: alloy
+    restart: unless-stopped
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+    network_mode: host
+    pid: host
+    volumes:
+      # Alloy configuration
+      - ./config.alloy:/etc/alloy/config.alloy:ro
+      # Host filesystem access for system metrics (replaces Node Exporter)
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+      # Laravel log files (read-only)
+      - /var/www/html/storage/logs:/var/www/html/storage/logs:ro
+      # Nginx and PHP-FPM logs (read-only)
+      - /var/log/nginx:/var/log/nginx:ro
+      - /var/log:/var/log:ro
+      # Persistent storage for Alloy's WAL (Write-Ahead Log)
+      - alloy-data:/var/lib/alloy/data
+    environment:
+      - HOSTNAME=${HOSTNAME:-laravel-app}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://localhost:12345/ready || exit 1",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  alloy-data:
