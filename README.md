@@ -330,15 +330,16 @@ curl -s http://127.0.0.1:8080/nginx_status
 
 ```bash
 # Enable the status path in PHP-FPM pool config
-sudo sed -i 's/;pm.status_path = \/status/pm.status_path = \/status/' /etc/php/*/fpm/pool.d/www.conf
+sudo sed -i 's#^;*pm.status_path = .*#pm.status_path = /fpm-status.php#' /etc/php/*/fpm/pool.d/www.conf
 sudo systemctl restart php*-fpm
 
 # Rewrite the dedicated status server so it exposes both endpoints on 127.0.0.1:8080
-# Adjust the PHP-FPM socket path if your version differs (for example: /run/php/php8.3-fpm.sock)
+# Adjust the PHP-FPM socket path and Laravel public path if your host differs.
 sudo tee /etc/nginx/conf.d/stub_status.conf << 'EOF'
 server {
     listen 8080;
     server_name localhost;
+    root /var/www/html/public;
 
     location /nginx_status {
         stub_status on;
@@ -346,11 +347,13 @@ server {
         deny all;
     }
 
-    location /fpm-status {
+    location = /fpm-status.php {
         include fastcgi_params;
         fastcgi_pass unix:/run/php/php-fpm.sock;
-        fastcgi_param SCRIPT_FILENAME "";
-        fastcgi_param SCRIPT_NAME /fpm-status;
+        fastcgi_param SCRIPT_FILENAME /var/www/html/public/index.php;
+        fastcgi_param SCRIPT_NAME /fpm-status.php;
+        fastcgi_param REQUEST_URI /fpm-status.php;
+        fastcgi_param DOCUMENT_URI /fpm-status.php;
         allow 127.0.0.1;
         deny all;
     }
@@ -359,7 +362,7 @@ EOF
 sudo nginx -t && sudo systemctl reload nginx
 
 # Verify: should return PHP-FPM pool status
-curl -s http://127.0.0.1:8080/fpm-status
+curl -s http://127.0.0.1:8080/fpm-status.php
 ```
 
 > **What about Node Exporter?** You don't need it at all. Alloy's built-in `prometheus.exporter.unix` reads directly from Linux's `/proc` and `/sys` filesystems — same data, zero extra processes.
