@@ -2,9 +2,9 @@
 
 A complete, production-ready centralized observability platform using **Loki** (logs), **Grafana** (visualization), **Tempo** (traces), and **Mimir** (metrics), with **Grafana Alloy** as the unified collector agent on each application node.
 
-> **Gold Standard Approach**: This setup uses Alloy as the unified collector with **built-in system metrics** (replacing Node Exporter), lightweight **Nginx and PHP-FPM exporter binaries**, and **OpenTelemetry auto-instrumentation** for deep request-level tracing.
+> **Gold Standard Approach**: This setup uses Alloy as the unified collector with **built-in system metrics** (replacing Node Exporter), lightweight **standalone Nginx and PHP-FPM exporter binaries**, and **OpenTelemetry auto-instrumentation** for deep request-level tracing.
 
-**Key difference from traditional setups**: Alloy handles system metrics, log collection, and trace forwarding natively. Nginx and PHP-FPM metrics require small standalone exporter binaries that convert their status pages to Prometheus format.
+**Key difference from traditional setups**: Alloy handles system metrics (`prometheus.exporter.unix`), log collection, and trace forwarding natively. Nginx and PHP-FPM metrics require standalone exporter binaries (`nginx-prometheus-exporter` on `:9113`, `php-fpm_exporter` on `:9253`) that Alloy scrapes via `prometheus.scrape`.
 
 ---
 
@@ -18,6 +18,7 @@ A complete, production-ready centralized observability platform using **Loki** (
 6. [Grafana Configuration](#6-grafana-configuration)
 7. [Security & Networking](#7-security--networking)
 8. [Verification & Testing](#8-verification--testing)
+9. [Troubleshooting](#9-troubleshooting)
 
 ---
 
@@ -306,38 +307,24 @@ alloy --version
 
 The Nginx and PHP-FPM exporter binaries read these status pages and convert them to Prometheus metrics that Alloy scrapes.
 
-#### Nginx `stub_status` (required for Nginx metrics)
-
-```bash
-sudo tee /etc/nginx/conf.d/stub_status.conf << 'EOF'
-server {
-    listen 8080;
-    server_name localhost;
-    location /nginx_status {
-        stub_status on;
-        allow 127.0.0.1;
-        deny all;
-    }
-}
-EOF
-sudo nginx -t && sudo systemctl reload nginx
-
-# Verify: should return Active connections, accepts, handled, requests
-curl -s http://127.0.0.1:8080/nginx_status
-```
-
-#### PHP-FPM Status Page (required for PHP-FPM metrics)
+#### Step 1: Enable PHP-FPM Status Path
 
 ```bash
 # Enable the status path in PHP-FPM pool config
 sudo sed -i 's#^;*pm.status_path = .*#pm.status_path = /fpm-status#' /etc/php/*/fpm/pool.d/www.conf
 sudo systemctl restart php*-fpm
+```
 
-# Rewrite the dedicated status server so it exposes both endpoints on 127.0.0.1:8080
-# IMPORTANT: Do NOT use "include fastcgi_params" here — duplicate SCRIPT_NAME values
-# cause PHP-FPM to ignore the status path. Specify only the params needed.
-# Adjust the PHP-FPM socket path if your host differs (check: ls /run/php/).
-sudo tee /etc/nginx/conf.d/stub_status.conf << 'EOF'
+#### Step 2: Create the Nginx Status Server
+
+> **IMPORTANT**: Do **not** use `include fastcgi_params` in the `/fpm-status` block — it overrides `SCRIPT_NAME` and causes "File not found" or "Access denied" errors. Only specify the exact params needed.
+
+```bash
+# Check your PHP-FPM socket path first (adjust the fastcgi_pass line below if different)
+ls /run/php/
+
+# Create the combined status server on port 8080
+sudo tee /etc/nginx/conf.d/stub_status.conf > /dev/null << 'EOF'
 server {
     listen 8080;
     server_name localhost;
@@ -361,22 +348,93 @@ server {
 }
 EOF
 sudo nginx -t && sudo systemctl reload nginx
+```
 
-# Verify: should return PHP-FPM pool status (pool: www, process manager: dynamic, ...)
+#### Step 3: Verify Both Endpoints
+
+```bash
+# Nginx status — should show: Active connections, accepts, handled, requests
+curl -s http://127.0.0.1:8080/nginx_status
+
+# PHP-FPM status — should show: pool, process manager, start time, ...
 curl -s http://127.0.0.1:8080/fpm-status
 ```
 
+> **Common issues**:
+> - `File not found.` → `SCRIPT_NAME` mismatch with `pm.status_path`, or `include fastcgi_params` is overriding values
+> - `Access denied.` → `security.limit_extensions` blocking. Set `SCRIPT_FILENAME /fpm-status.php;` (must end in `.php`)
+> - `502 Bad Gateway` → PHP-FPM socket path is wrong. Check `ls /run/php/` for the actual socket (e.g., `php8.3-fpm.sock`)
+> - `location directive not allowed here` → The `location` block must be inside a `server {}` block
+
 > **What about Node Exporter?** You don't need it. Alloy's built-in `prometheus.exporter.unix` reads directly from Linux's `/proc` and `/sys` filesystems — same data, zero extra processes. For Nginx and PHP-FPM, small standalone exporter binaries (`nginx-prometheus-exporter` on `:9113`, `php-fpm_exporter` on `:9253`) are needed because Alloy does not have built-in exporters for those.
 
-### 4.3 Deploy the Alloy Configuration
+### 4.3 Install Nginx & PHP-FPM Exporter Binaries
+
+Alloy scrapes metrics from these standalone exporters. Install them on each Laravel EC2:
+
+```bash
+# --- Nginx Prometheus Exporter ---
+# Downloads the binary and creates a systemd service
+curl -sL https://github.com/nginxinc/nginx-prometheus-exporter/releases/download/v1.4.0/nginx-prometheus-exporter_1.4.0_linux_amd64.tar.gz \
+  | sudo tar xz -C /usr/local/bin/ nginx-prometheus-exporter
+
+sudo tee /etc/systemd/system/nginx-prometheus-exporter.service << 'EOF'
+[Unit]
+Description=Nginx Prometheus Exporter
+After=nginx.service
+
+[Service]
+ExecStart=/usr/local/bin/nginx-prometheus-exporter --nginx.scrape-uri=http://127.0.0.1:8080/nginx_status
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now nginx-prometheus-exporter
+
+# Verify: should return Prometheus metrics
+curl -s http://127.0.0.1:9113/metrics | head -5
+
+# --- PHP-FPM Exporter ---
+curl -sL https://github.com/hipages/php-fpm_exporter/releases/download/v2.2.0/php-fpm_exporter_2.2.0_linux_amd64.tar.gz \
+  | sudo tar xz -C /usr/local/bin/ php-fpm_exporter
+
+sudo tee /etc/systemd/system/php-fpm-exporter.service << 'EOF'
+[Unit]
+Description=PHP-FPM Prometheus Exporter
+After=php8.3-fpm.service
+
+[Service]
+Environment=PHP_FPM_SCRAPE_URI=tcp://127.0.0.1:8080/fpm-status
+ExecStart=/usr/local/bin/php-fpm_exporter server
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now php-fpm-exporter
+
+# Verify: should return Prometheus metrics
+curl -s http://127.0.0.1:9253/metrics | head -5
+```
+
+> **Docker users**: If you're following the [Docker deployment guide](README-docker.md), these exporters run as sidecar containers instead. Skip this section and follow Section 4 there.
+
+### 4.4 Deploy the Alloy Configuration
 
 ```bash
 # Copy the Alloy config to the correct location
 sudo cp alloy/config.alloy /etc/alloy/config.alloy
 
 # CRITICAL: Edit the config and replace these placeholders:
-#   - LGTM_SERVER_PRIVATE_IP → your LGTM server's private IP (e.g., 10.0.1.50)
-#   - instance = "laravel-app-1" → unique name per EC2 (laravel-app-1 through laravel-app-6)
+#   - LGTM_SERVER_PRIVATE_IP → your LGTM server's private IP (e.g., 172.31.27.45)
+#   - instance = "laravel-app-1" → unique name per EC2 (e.g., duadualive-staging)
+#   - location = "Asia/Kuala_Lumpur" → your server's IANA timezone
+#   - Laravel log path → adjust if your app is not at /var/www/html
 sudo nano /etc/alloy/config.alloy
 
 # Restart Alloy to apply
@@ -387,20 +445,20 @@ sudo systemctl status alloy
 sudo journalctl -u alloy -f --no-pager -n 50
 ```
 
-### 4.4 What Alloy Collects (No Extra Installation Needed)
+### 4.5 What Alloy Collects
 
 Alloy's configuration file handles everything with zero standalone exporters:
 
-| What                          | Alloy Component               | Old Approach                       | Metrics                                                |
-| ----------------------------- | ----------------------------- | ---------------------------------- | ------------------------------------------------------ |
-| **System (CPU/RAM/Disk/Net)** | `prometheus.exporter.unix`    | Standalone Node Exporter binary    | `node_cpu_seconds_total`, `node_memory_*`, etc.        |
-| **Nginx**                     | `prometheus.exporter.nginx`   | Standalone Nginx Exporter binary   | `nginx_connections_*`, `nginx_http_requests_total`     |
-| **PHP-FPM**                   | `prometheus.exporter.php_fpm` | Standalone PHP-FPM Exporter binary | `phpfpm_active_processes`, `phpfpm_listen_queue`, etc. |
-| **Laravel Logs**              | `loki.source.file`            | Same ✓                             | Log lines → Loki                                       |
-| **Nginx/PHP-FPM Logs**        | `loki.source.file`            | Same ✓                             | Log lines → Loki                                       |
-| **Traces (OTLP)**             | `otelcol.receiver.otlp`       | Same ✓                             | Spans → Tempo                                          |
+| What                          | How                                          | Metrics                                                |
+| ----------------------------- | -------------------------------------------- | ------------------------------------------------------ |
+| **System (CPU/RAM/Disk/Net)** | Alloy built-in `prometheus.exporter.unix`    | `node_cpu_seconds_total`, `node_memory_*`, etc.        |
+| **Nginx**                     | Standalone `nginx-prometheus-exporter` → Alloy `prometheus.scrape` on `:9113` | `nginx_connections_*`, `nginx_http_requests_total` |
+| **PHP-FPM**                   | Standalone `php-fpm_exporter` → Alloy `prometheus.scrape` on `:9253` | `phpfpm_active_processes`, `phpfpm_listen_queue`, etc. |
+| **Laravel Logs**              | Alloy `loki.source.file`                     | Log lines → Loki                                       |
+| **Nginx/PHP-FPM Logs**        | Alloy `loki.source.file`                     | Log lines → Loki                                       |
+| **Traces (OTLP)**             | Alloy `otelcol.receiver.otlp`                | Spans → Tempo                                          |
 
-> **Result**: Instead of managing 4 systemd services (Alloy + 3 exporters), you manage **just 1** (Alloy). Less maintenance, fewer failure points, and unified configuration.
+> **Result**: Instead of managing 4 separate systemd services, you manage Alloy + 2 lightweight exporter binaries. System metrics are built-in (no Node Exporter needed). Nginx and PHP-FPM exporters are required because Alloy does not have built-in components for those.
 
 ---
 
@@ -456,8 +514,8 @@ OTEL_TRACES_SAMPLER_ARG=1.0
 This middleware injects the trace ID into every log entry, enabling one-click navigation from a log line in Loki to its full trace waterfall in Tempo.
 
 ```bash
-# Copy the reference middleware
-cp laravel/TraceIdMiddleware.php /var/www/html/app/Http/Middleware/TraceIdMiddleware.php
+# Copy the reference middleware (adjust path to your Laravel project)
+cp laravel/TraceIdMiddleware.php /home/theone/kol/app/Http/Middleware/TraceIdMiddleware.php
 ```
 
 Register it in `bootstrap/app.php` (Laravel 11+):
@@ -544,7 +602,7 @@ Import these community dashboards via **Grafana UI → Dashboards → Import**:
 | Loki Dashboard (logs volume) | `13639`    | Log ingestion rate, error rates, top sources |
 | Mimir / Prometheus Overview  | `3662`     | Metric ingestion, query performance          |
 
-> **Note on dashboard compatibility**: Alloy's `prometheus.exporter.unix` emits the same `node_*` metrics as standalone Node Exporter, so dashboard `1860` works without changes. Nginx and PHP-FPM metric names are also compatible.
+> **Note on dashboard compatibility**: Alloy's `prometheus.exporter.unix` emits the same `node_*` metrics as standalone Node Exporter, so dashboard `1860` works without changes. The standalone `nginx-prometheus-exporter` and `php-fpm_exporter` also use standard metric names.
 
 #### Custom Laravel Dashboard (create manually)
 
@@ -687,8 +745,8 @@ sudo systemctl status alloy
 sudo journalctl -u alloy --since "5 minutes ago" --no-pager
 
 # Alloy's built-in debug UI (accessible locally)
-curl -s http://localhost:12345/ready
-# Expected: "ready"
+curl -s http://localhost:12345/ | head -1
+# Expected: HTML page (<!doctype html>...) — this is Alloy's debug UI
 ```
 
 ### 8.3 Verify Data Flow
@@ -696,26 +754,27 @@ curl -s http://localhost:12345/ready
 #### Logs (Loki)
 
 ```bash
-# From the LGTM server — query recent logs
-curl -s "http://localhost:3100/loki/api/v1/query?query={job=%22laravel%22}&limit=5" | jq .
+# From the LGTM server — query recent logs (use single quotes to avoid shell escaping issues)
+curl -s 'http://localhost:3100/loki/api/v1/query?query={instance="YOUR_INSTANCE"}&limit=5' | jq .
 
-# Or use Grafana: navigate to Explore → Loki → query: {job="laravel"}
+# Or use Grafana: navigate to Explore → Loki → query: {instance="YOUR_INSTANCE"}
 ```
 
 #### Metrics (Mimir)
 
 ```bash
-# From the LGTM server — query a common metric
-curl -s "http://localhost:9009/prometheus/api/v1/query?query=up" | jq .
+# From the LGTM server — query a common metric (URL-encode curly braces for Mimir)
+curl -s 'http://localhost:9009/prometheus/api/v1/query?query=up%7Binstance%3D%22YOUR_INSTANCE%22%7D' | jq .
 
-# Expected: results showing your scraped targets
+# Or simply query all:
+curl -s 'http://localhost:9009/prometheus/api/v1/query?query=up' | jq .
 ```
 
 #### Traces (Tempo)
 
 ```bash
 # Search for recent traces via Tempo API
-curl -s "http://localhost:3200/api/search?limit=5" | jq .
+curl -s 'http://localhost:3200/api/search?limit=5' | jq .
 
 # Or use Grafana: navigate to Explore → Tempo → Search
 ```
@@ -725,9 +784,8 @@ curl -s "http://localhost:3200/api/search?limit=5" | jq .
 Run this from any Laravel EC2 to generate test data:
 
 ```bash
-# Generate a test log entry
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] production.ERROR: Smoke test from $(hostname)" \
-  >> /var/www/html/storage/logs/laravel.log
+# Generate a test log entry (use sudo -u to match the Laravel app's file owner)
+sudo -u theone bash -c 'echo "['"$(date '+%Y-%m-%d %H:%M:%S')"'] production.ERROR: Smoke test from '"$(hostname)"'" >> /home/theone/kol/storage/logs/laravel.log'
 
 # Generate a test trace (via OTLP HTTP directly)
 curl -X POST http://localhost:4318/v1/traces \
@@ -822,12 +880,69 @@ log-monitoring/
 │           └── datasources/
 │               └── datasources.yaml   ← Auto-provisioned datasources
 ├── alloy/
-│   └── config.alloy                   ← Alloy config (system metrics built-in, Nginx/PHP-FPM via exporters)
+│   └── config.alloy                   ← Alloy config (systemd version — system metrics built-in, Nginx/PHP-FPM via standalone exporters)
+├── alloy-docker/                      ← Docker-based Alloy deployment (see README-docker.md)
+│   ├── docker-compose.yml             ← Alloy + sidecar exporters container definitions
+│   └── config.alloy                   ← Alloy config (Docker version — functionally identical)
 └── laravel/
     ├── README.md                      ← Laravel integration guide
     ├── TraceIdMiddleware.php           ← Reference: log↔trace correlation middleware
     └── .env.otel.example              ← Reference: OpenTelemetry .env variables
 ```
+
+---
+
+## 9. Troubleshooting
+
+### 9.1 Loki Rejects Laravel Logs — "timestamp too new"
+
+**Symptom**: Alloy logs show `status=400` errors like `"has timestamp too new"`
+
+**Cause**: Laravel logs use server local time without timezone info. If `stage.timestamp` in `config.alloy` doesn't specify a `location`, Alloy parses as UTC, making timestamps appear hours in the future for non-UTC servers.
+
+**Fix**: Add `location` to `stage.timestamp` in `config.alloy`:
+
+```
+stage.timestamp {
+    source   = "timestamp"
+    format   = "2006-01-02 15:04:05"
+    location = "Asia/Kuala_Lumpur"   // Change to your server's IANA timezone
+}
+```
+
+### 9.2 Alloy Shows "component does not exist" for Nginx/PHP-FPM
+
+**Cause**: Alloy does **not** have built-in `prometheus.exporter.nginx` or `prometheus.exporter.php_fpm` components. These require standalone exporter binaries (see [Section 4.3](#43-install-nginx--php-fpm-exporter-binaries)).
+
+### 9.3 Permission Denied Writing Test Log Entries
+
+**Fix**: Use `sudo -u <appuser>` when writing test entries to Laravel log files:
+
+```bash
+sudo -u theone bash -c 'echo "['"$(date '+%Y-%m-%d %H:%M:%S')"'] production.ERROR: Test" >> /home/theone/kol/storage/logs/laravel.log'
+```
+
+### 9.4 No Data in Grafana
+
+Check connectivity from the Laravel EC2 to the LGTM server:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}" http://LGTM_SERVER_IP:3100/ready   # Loki → 200
+curl -s -o /dev/null -w "%{http_code}" http://LGTM_SERVER_IP:9009/ready   # Mimir → 200
+curl -s -o /dev/null -w "%{http_code}" http://LGTM_SERVER_IP:4318/v1/traces  # Tempo → 405
+```
+
+`000` = connection refused → check AWS security groups (ports 3100, 9009, 4317, 4318).
+
+### 9.5 Useful Loki Queries
+
+| Query | What it shows |
+|---|---|
+| `{job="laravel", instance="YOUR_INSTANCE"}` | All Laravel application logs |
+| `{job="laravel", instance="YOUR_INSTANCE", level="ERROR"}` | Laravel errors only |
+| `{job="nginx", instance="YOUR_INSTANCE"}` | Nginx access + error logs |
+| `{job="php-fpm", instance="YOUR_INSTANCE"}` | PHP-FPM process logs |
+| `{instance="YOUR_INSTANCE"} \|= "ERROR"` | Text search for "ERROR" across all logs |
 
 ---
 
@@ -841,10 +956,11 @@ log-monitoring/
 - [ ] `docker compose up -d` — all services healthy
 - [ ] Grafana accessible at `http://<LGTM-IP>:3000`
 - [ ] Alloy installed on all 6 Laravel EC2 instances
-- [ ] Nginx `stub_status` enabled on each Laravel EC2
-- [ ] PHP-FPM `pm.status_path` enabled on each Laravel EC2
-- [ ] Alloy config updated with correct LGTM server IP and unique instance names
-- [ ] Alloy service running on all 6 instances with Nginx and PHP-FPM exporters
+- [ ] Nginx `stub_status` enabled on each Laravel EC2 (port 8080)
+- [ ] PHP-FPM `pm.status_path = /fpm-status` enabled on each Laravel EC2
+- [ ] Nginx & PHP-FPM exporter binaries installed and running on each Laravel EC2
+- [ ] Alloy config updated with correct LGTM server IP, unique instance names, and timezone
+- [ ] Alloy service running on all 6 instances
 - [ ] OpenTelemetry packages installed in Laravel (`keepsuit/laravel-opentelemetry`)
 - [ ] `.env` updated with OTEL variables on each instance
 - [ ] TraceId middleware registered in Laravel

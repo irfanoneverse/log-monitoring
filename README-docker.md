@@ -91,40 +91,28 @@ docker run --rm hello-world
 > [!CAUTION]
 > **This section modifies the host directly (outside Docker).** It changes Nginx and PHP-FPM configuration files on the Laravel EC2. These are the **only changes made to the host** (besides installing Docker).
 
-> This step is **identical** to [Section 4.2 of the main README](README.md#42-enable-nginx--php-fpm-status-endpoints). If you've already done this, skip ahead.
+> This step is **identical** to [Section 4.2 of the main README](README.md#42-enable-nginx--php-fpm-status-endpoints). If you've already configured Nginx stub_status and PHP-FPM status endpoints, skip ahead to [Section 4](#4-deploy-the-monitoring-agent).
 
-### 3.1 Nginx `stub_status`
-
-```bash
-sudo tee /etc/nginx/conf.d/stub_status.conf << 'EOF'
-server {
-    listen 8080;
-    server_name localhost;
-    location /nginx_status {
-        stub_status on;
-        allow 127.0.0.1;
-        deny all;
-    }
-}
-EOF
-sudo nginx -t && sudo systemctl reload nginx
-
-# Verify: should return Active connections, accepts, handled, requests
-curl -s http://127.0.0.1:8080/nginx_status
-```
-
-### 3.2 PHP-FPM Status Page
+### 3.1 Enable PHP-FPM Status Path
 
 ```bash
 # Enable the status path in PHP-FPM pool config
 sudo sed -i 's#^;*pm.status_path = .*#pm.status_path = /fpm-status#' /etc/php/*/fpm/pool.d/www.conf
 sudo systemctl restart php*-fpm
+```
 
-# Rewrite the dedicated status server so it exposes both endpoints on 127.0.0.1:8080
-# IMPORTANT: Do NOT use "include fastcgi_params" here — duplicate SCRIPT_NAME values
-# cause PHP-FPM to ignore the status path. Specify only the params needed.
-# Adjust the PHP-FPM socket path if your host differs (check: ls /run/php/).
-sudo tee /etc/nginx/conf.d/stub_status.conf << 'EOF'
+### 3.2 Create the Nginx Status Server
+
+This creates a dedicated Nginx server on port 8080 that exposes both Nginx and PHP-FPM status endpoints.
+
+> **IMPORTANT**: Do **not** use `include fastcgi_params` in the `/fpm-status` block — it overrides the `SCRIPT_NAME` parameter and causes PHP-FPM to return "File not found" or "Access denied". Only specify the exact params needed.
+
+```bash
+# Check your PHP-FPM socket path first (adjust the fastcgi_pass line below if different)
+ls /run/php/
+
+# Create the combined status server on port 8080
+sudo tee /etc/nginx/conf.d/stub_status.conf > /dev/null << 'EOF'
 server {
     listen 8080;
     server_name localhost;
@@ -148,10 +136,23 @@ server {
 }
 EOF
 sudo nginx -t && sudo systemctl reload nginx
+```
 
-# Verify: should return PHP-FPM pool status (pool: www, process manager: dynamic, ...)
+### 3.3 Verify Both Endpoints
+
+```bash
+# Nginx status — should show: Active connections, accepts, handled, requests
+curl -s http://127.0.0.1:8080/nginx_status
+
+# PHP-FPM status — should show: pool, process manager, start time, ...
 curl -s http://127.0.0.1:8080/fpm-status
 ```
+
+> **Common issues**:
+> - `File not found.` → `SCRIPT_NAME` mismatch with `pm.status_path`, or you used `include fastcgi_params`
+> - `Access denied.` → `security.limit_extensions` blocking. Set `SCRIPT_FILENAME /fpm-status.php;` (must end in `.php`)
+> - `502 Bad Gateway` → PHP-FPM socket path is wrong. Check `ls /run/php/` for the actual socket file (e.g., `php8.3-fpm.sock`)
+> - `location directive not allowed here` → The `location` block must be inside a `server {}` block
 
 ---
 
@@ -178,32 +179,41 @@ nano config.alloy
 
 Replace these placeholders:
 
-| Placeholder                  | Replace With                  | Example                                 |
-| ---------------------------- | ----------------------------- | --------------------------------------- |
-| `LGTM_SERVER_PRIVATE_IP`     | Your LGTM server's private IP | `10.0.1.50`                             |
-| `instance = "laravel-app-1"` | Unique name for this EC2      | `laravel-app-1` through `laravel-app-6` |
+| Placeholder                  | Replace With                      | Example                                 |
+| ---------------------------- | --------------------------------- | --------------------------------------- |
+| `LGTM_SERVER_PRIVATE_IP`     | Your LGTM server's private IP     | `172.31.27.45`                          |
+| `instance = "laravel-app-1"` | Unique name for this EC2          | `duadualive-staging`, `laravel-app-2`   |
+| `location = "Asia/Kuala_Lumpur"` | Your server's timezone (IANA) | `Asia/Singapore`, `UTC`, `America/New_York` |
 
 > **There are 3 places** where you need to replace `LGTM_SERVER_PRIVATE_IP`:
 >
-> 1. `loki.write` → `url` (line ~87)
-> 2. `prometheus.remote_write` → `url` (line ~158)
-> 3. `otelcol.exporter.otlphttp` → `endpoint` (line ~213)
+> 1. `loki.write` → `url` (line ~91)
+> 2. `prometheus.remote_write` → `url` (line ~159)
+> 3. `otelcol.exporter.otlphttp` → `endpoint` (line ~214)
 
 > **There are 2 places** where you need to set the instance name:
 >
-> 1. `loki.process` → `stage.static_labels` → `instance` (line ~48)
-> 2. `prometheus.relabel` → `rule` → `replacement` (line ~147)
+> 1. `loki.process` → `stage.static_labels` → `instance` (line ~52)
+> 2. `prometheus.relabel` → `rule` → `replacement` (line ~151)
+
+> **Timezone**: The `stage.timestamp` block (line ~67) has `location = "Asia/Kuala_Lumpur"`. If your servers are in a different timezone, change this to the correct [IANA timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones). **Getting this wrong causes Loki to reject all Laravel logs** with "timestamp too new" errors.
 
 ### 4.3 Verify Log Paths
 
-Make sure the Laravel log directory path matches your actual setup:
+Make sure the Laravel log directory path matches your actual setup. The default config uses `/home/theone/kol/storage/logs/` — update if your app is in a different location:
 
 ```bash
-# Check where your Laravel logs are
-ls -la /var/www/html/storage/logs/
+# Find your Laravel project root (look for artisan, storage/, public/)
+# Common locations: /home/<user>/<app>, /var/www/html, /var/www/<app>
+ls -la /home/theone/kol/storage/logs/
 
-# If your Laravel app is in a different directory (e.g., /var/www/your-app),
-# update both docker-compose.yml volumes AND config.alloy paths accordingly
+# If your path is DIFFERENT, update these 2 files:
+# 1. config.alloy → local.file_match "laravel_logs" → __path__
+# 2. docker-compose.yml → alloy volumes → Laravel log mount
+#
+# Example: if your app is at /var/www/myapp, change:
+#   config.alloy:        "/var/www/myapp/storage/logs/*.log"
+#   docker-compose.yml:  /var/www/myapp/storage/logs:/var/www/myapp/storage/logs:ro
 ```
 
 ### 4.4 Start the Monitoring Agent
@@ -413,12 +423,12 @@ Follow [Section 4](#4-deploy-the-monitoring-agent) above.
 # Check Alloy container is healthy
 docker compose ps
 
-# Check readiness
-curl -s http://localhost:12345/ready
+# Check Alloy is running (returns HTML debug UI)
+curl -s http://localhost:12345/ | head -1
 
 # Verify in Grafana that data from this instance is still flowing:
-# - Explore → Loki → {instance="laravel-app-1"} → should see new logs
-# - Explore → Mimir → up{instance="laravel-app-1"} → should show 1
+# - Explore → Loki → {instance="YOUR_INSTANCE"} → should see new logs
+# - Explore → Mimir → up{instance="YOUR_INSTANCE"} → should show 1
 ```
 
 ### 7.4 (Optional) Clean Up Systemd Alloy
@@ -516,9 +526,8 @@ Or verify in **Grafana UI** at `http://<LGTM-IP>:3000`:
 Run this from the Laravel EC2:
 
 ```bash
-# Generate a test log entry
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] production.ERROR: Docker smoke test from $(hostname)" \
-  >> /home/theone/kol/storage/logs/laravel.log
+# Generate a test log entry (use sudo -u to match the Laravel app's file owner)
+sudo -u theone bash -c 'echo "['"$(date '+%Y-%m-%d %H:%M:%S')"'] production.ERROR: Docker smoke test from '"$(hostname)"'" >> /home/theone/kol/storage/logs/laravel.log'
 
 # Generate a test trace (via OTLP HTTP)
 curl -X POST http://localhost:4318/v1/traces \
@@ -551,6 +560,126 @@ curl -X POST http://localhost:4318/v1/traces \
 
 ---
 
+## 9. Troubleshooting
+
+### 9.1 Loki Rejects Laravel Logs — "timestamp too new"
+
+**Symptom**: Alloy logs show `status=400` errors:
+
+```
+error="server returned HTTP status 400 Bad Request (400): entry for stream '...' has timestamp too new: ..."
+```
+
+**Cause**: Laravel logs use server local time (e.g., `[2026-03-06 11:51:25]`) without timezone info. If `stage.timestamp` in `config.alloy` doesn't specify a `location`, Alloy parses the timestamp as UTC. For a UTC+8 server, this makes the timestamp appear 8 hours in the future — and Loki rejects it.
+
+**Fix**: Ensure `config.alloy` has the correct timezone in `stage.timestamp`:
+
+```
+stage.timestamp {
+    source   = "timestamp"
+    format   = "2006-01-02 15:04:05"
+    location = "Asia/Kuala_Lumpur"   // Change to your server's IANA timezone
+}
+```
+
+### 9.2 Permission Denied Writing Test Log Entries
+
+**Symptom**: `bash: /home/theone/kol/storage/logs/laravel.log: Permission denied`
+
+**Cause**: Log files are owned by the Laravel app user (e.g., `theone`), not the `ubuntu` SSH user.
+
+**Fix**: Use `sudo -u` to write as the app user:
+
+```bash
+sudo -u theone bash -c 'echo "['"$(date '+%Y-%m-%d %H:%M:%S')"'] production.ERROR: Test" >> /home/theone/kol/storage/logs/laravel.log'
+```
+
+### 9.3 Alloy Shows "component does not exist" for Nginx/PHP-FPM
+
+**Symptom**: Alloy logs show:
+
+```
+cannot find the definition of component name "prometheus.exporter.nginx"
+cannot find the definition of component name "prometheus.exporter.php_fpm"
+```
+
+**Cause**: Alloy does **not** have built-in Nginx or PHP-FPM exporters. These are separate processes.
+
+**Fix**: Use the sidecar exporter containers in `docker-compose.yml` (already included). Alloy scrapes them via `prometheus.scrape` on `:9113` (Nginx) and `:9253` (PHP-FPM).
+
+### 9.4 Backfilling Historical Logs
+
+By default, `tail_from_end = true` means Alloy only reads **new** log lines. To ingest historical logs:
+
+1. **On the LGTM server** — increase Loki's max age for old entries in `loki-config.yaml`:
+
+```yaml
+limits_config:
+  reject_old_samples_max_age: 4380h   # ~6 months
+```
+
+Restart Loki: `docker compose restart loki`
+
+2. **On the Laravel EC2** — temporarily change Alloy and clear its position file:
+
+```bash
+# Edit config.alloy: change tail_from_end = true → false
+cd /opt/monitoring/alloy-docker
+
+# Remove volume (clears position tracking) and restart
+docker compose down -v
+docker compose up -d
+
+# Watch progress — should see "Seeked ... Offset:0"
+docker compose logs -f alloy 2>&1 | head -50
+```
+
+3. **After backfill completes** (1-2 minutes for typical log sizes):
+
+```bash
+# Change tail_from_end back to true in config.alloy
+# Then restart (do NOT use -v this time):
+docker compose restart alloy
+```
+
+> ⚠️ Loki's `reject_old_samples_max_age` limits how far back you can go. Logs older than this age will be silently rejected.
+
+### 9.5 Useful Loki Queries
+
+Use these in **Grafana → Explore → Loki**:
+
+| Query | What it shows |
+|---|---|
+| `{job="laravel", instance="YOUR_INSTANCE"}` | All Laravel application logs |
+| `{job="laravel", instance="YOUR_INSTANCE", level="ERROR"}` | Laravel errors only |
+| `{job="laravel", instance="YOUR_INSTANCE", level="WARNING"}` | Laravel warnings only |
+| `{job="nginx", instance="YOUR_INSTANCE"}` | Nginx access + error logs |
+| `{job="php-fpm", instance="YOUR_INSTANCE"}` | PHP-FPM process logs |
+| `{job="syslog", instance="YOUR_INSTANCE"}` | System logs (OS-level) |
+| `{instance="YOUR_INSTANCE"} \|= "ERROR"` | Text search for "ERROR" across all logs |
+| `{job="laravel"} \| logfmt \| line_format "{{.level}}: {{.message}}"` | Formatted output |
+
+### 9.6 No Data in Grafana After Deployment
+
+**Check connectivity** from the Laravel EC2 to the LGTM server:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}" http://LGTM_SERVER_IP:3100/ready   # Loki
+curl -s -o /dev/null -w "%{http_code}" http://LGTM_SERVER_IP:9009/ready   # Mimir
+curl -s -o /dev/null -w "%{http_code}" http://LGTM_SERVER_IP:4318/v1/traces  # Tempo
+```
+
+- `200` / `405` = port is reachable ✅
+- `000` = connection refused/timeout → **check AWS security groups** (LGTM server must allow inbound from Laravel SG on ports 3100, 9009, 4317, 4318)
+
+**Check Alloy push errors**:
+
+```bash
+docker compose logs --tail=50 alloy 2>&1 | grep -i -E "error|fail|refused|timeout"
+```
+
+---
+
 ## File Structure
 
 ```
@@ -572,8 +701,8 @@ log-monitoring/
 │               └── datasources.yaml   ← Auto-provisioned datasources
 ├── alloy/
 │   └── config.alloy                   ← Alloy config (systemd version)
-├── alloy-docker/                      ← NEW: Docker-based Alloy deployment
-│   ├── docker-compose.yml             ← Alloy container definition
+├── alloy-docker/                      ← Docker-based Alloy deployment (this guide)
+│   ├── docker-compose.yml             ← Alloy + sidecar exporters container definitions
 │   └── config.alloy                   ← Alloy config (Docker version)
 └── laravel/
     ├── README.md                      ← Laravel integration guide
@@ -599,10 +728,11 @@ log-monitoring/
 
 - [ ] Docker and Docker Compose installed on all 6 Laravel EC2 instances
 - [ ] Docker daemon enabled on boot (`systemctl enable docker`)
-- [ ] Nginx `stub_status` enabled on each Laravel EC2
-- [ ] PHP-FPM `pm.status_path` enabled on each Laravel EC2
-- [ ] Alloy config updated with correct LGTM server IP and unique instance names
-- [ ] `docker compose up -d` — Alloy container is healthy
+- [ ] Nginx `stub_status` enabled on port 8080 (`/nginx_status`)
+- [ ] PHP-FPM `pm.status_path = /fpm-status` enabled (no `include fastcgi_params`!)
+- [ ] Both status pages verified: `curl http://127.0.0.1:8080/nginx_status` and `curl http://127.0.0.1:8080/fpm-status`
+- [ ] Alloy config updated: LGTM server IP, unique instance names, correct timezone, correct Laravel log path
+- [ ] `docker compose up -d` — all 3 containers healthy (alloy, nginx-exporter, phpfpm-exporter)
 - [ ] OpenTelemetry packages installed in Laravel (`keepsuit/laravel-opentelemetry`)
 - [ ] `.env` updated with OTEL variables on each instance
 - [ ] TraceId middleware registered in Laravel

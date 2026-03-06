@@ -34,17 +34,19 @@ php artisan vendor:publish --provider="Keepsuit\LaravelOpenTelemetry\LaravelOpen
 Copy the variables from [`.env.otel.example`](.env.otel.example) into your Laravel `.env`:
 
 ```bash
-cat .env.otel.example >> /var/www/html/.env
+# Adjust the path to your Laravel project directory
+cat .env.otel.example >> /home/theone/kol/.env
 ```
 
-Then edit `OTEL_SERVICE_NAME` to match the instance (e.g., `laravel-app-1`).
+Then edit `OTEL_SERVICE_NAME` to match the instance (e.g., `duadualive-staging`, `laravel-app-2`).
 
 ## 3. Install the TraceId Middleware
 
 Copy [`TraceIdMiddleware.php`](TraceIdMiddleware.php) to your app:
 
 ```bash
-cp TraceIdMiddleware.php /var/www/html/app/Http/Middleware/TraceIdMiddleware.php
+# Adjust the path to your Laravel project directory
+cp TraceIdMiddleware.php /home/theone/kol/app/Http/Middleware/TraceIdMiddleware.php
 ```
 
 Register it in `bootstrap/app.php` (Laravel 11+):

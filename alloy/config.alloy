@@ -18,8 +18,8 @@
 // Discover local log files
 local.file_match "laravel_logs" {
   path_targets = [
-    // Laravel application log
-    { __path__ = "/var/www/html/storage/logs/*.log", job = "laravel", app = "laravel" },
+    // Laravel application log — adjust path to your Laravel project
+    { __path__ = "/home/theone/kol/storage/logs/*.log", job = "laravel", app = "laravel" },
     // Nginx access and error logs
     { __path__ = "/var/log/nginx/access.log", job = "nginx", app = "nginx" },
     { __path__ = "/var/log/nginx/error.log",  job = "nginx", app = "nginx" },
