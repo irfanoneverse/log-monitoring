@@ -55,9 +55,12 @@ loki.process "laravel_pipeline" {
   }
 
   // Set the timestamp from the log line
+  // Laravel logs use server local time (no timezone in the format),
+  // so we must specify the server's timezone to avoid clock skew.
   stage.timestamp {
-    source = "timestamp"
-    format = "2006-01-02 15:04:05"
+    source   = "timestamp"
+    format   = "2006-01-02 15:04:05"
+    location = "Asia/Kuala_Lumpur"   // UTC+8 — change if your server is in a different timezone
   }
 
   // Promote parsed fields to labels
