@@ -230,12 +230,11 @@ docker compose ps
 ### 4.5 Verify Alloy Is Running
 
 ```bash
-# Check readiness
-curl -s http://localhost:12345/ready
-# Expected: "ready"
-
 # Alloy's debug UI is accessible at:
 # http://localhost:12345 (from the EC2 itself)
+# If the page loads (returns HTML), Alloy is running.
+curl -s http://localhost:12345/ | head -1
+# Expected: HTML page (<!doctype html>...)
 ```
 
 ---
