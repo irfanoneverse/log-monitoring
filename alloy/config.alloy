@@ -19,7 +19,7 @@
 local.file_match "laravel_logs" {
   path_targets = [
     // Laravel application log — adjust path to your Laravel project
-    { __path__ = "/data/cips/storage/logs/*.log", job = "laravel", app = "laravel" },
+    { __path__ = "/data/sso-api/storage/logs/*.log", job = "laravel", app = "laravel" },
     // Nginx access and error logs
     { __path__ = "/var/log/nginx/access.log", job = "nginx", app = "nginx" },
     { __path__ = "/var/log/nginx/error.log",  job = "nginx", app = "nginx" },
@@ -35,7 +35,7 @@ loki.source.file "log_scrape" {
   targets    = local.file_match.laravel_logs.targets
   forward_to = [loki.process.laravel_pipeline.receiver]
 
-  tail_from_end = true
+  tail_from_end = false
 }
 
 // Process logs: add labels, parse Laravel log format
@@ -45,7 +45,7 @@ loki.process "laravel_pipeline" {
     values = {
       hostname = env("HOSTNAME"),
       // Change this per instance to identify each Laravel app
-      instance = "cips-staging",
+      instance = "sso-api-staging",
     }
   }
 
@@ -157,7 +157,7 @@ prometheus.relabel "add_instance_labels" {
 
   rule {
     target_label = "instance"
-    replacement  = "cips-staging"   // Change per instance
+    replacement  = "sso-api-staging"   // Change per instance
   }
   rule {
     target_label = "environment"

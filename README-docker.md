@@ -182,7 +182,7 @@ Replace these placeholders:
 | Placeholder                  | Replace With                      | Example                                 |
 | ---------------------------- | --------------------------------- | --------------------------------------- |
 | `LGTM_SERVER_PRIVATE_IP`     | Your LGTM server's private IP     | `172.31.27.45`                          |
-| `instance = "laravel-app-1"` | Unique name for this EC2          | `duadualive-staging`, `laravel-app-2`   |
+| `instance = "laravel-app-1"` | Unique name for this EC2          | `sso-api-staging`, `duadualive-staging` |
 | `location = "Asia/Kuala_Lumpur"` | Your server's timezone (IANA) | `Asia/Singapore`, `UTC`, `America/New_York` |
 
 > **There are 3 places** where you need to replace `LGTM_SERVER_PRIVATE_IP`:
@@ -200,12 +200,12 @@ Replace these placeholders:
 
 ### 4.3 Verify Log Paths
 
-Make sure the Laravel log directory path matches your actual setup. The default config uses `/home/theone/kol/storage/logs/` — update if your app is in a different location:
+Make sure the Laravel log directory path matches your actual setup. The default config uses `/data/sso-api/storage/logs/` — update if your app is in a different location:
 
 ```bash
 # Find your Laravel project root (look for artisan, storage/, public/)
 # Common locations: /home/<user>/<app>, /var/www/html, /var/www/<app>
-ls -la /home/theone/kol/storage/logs/
+ls -la /data/sso-api/storage/logs/
 
 # If your path is DIFFERENT, update these 2 files:
 # 1. config.alloy → local.file_match "laravel_logs" → __path__
@@ -213,7 +213,7 @@ ls -la /home/theone/kol/storage/logs/
 #
 # Example: if your app is at /var/www/myapp, change:
 #   config.alloy:        "/var/www/myapp/storage/logs/*.log"
-#   docker-compose.yml:  /var/www/myapp/storage/logs:/var/www/myapp/storage/logs:ro
+#    docker-compose.yml:  /data/sso-api/storage/logs:/data/sso-api/storage/logs:ro
 ```
 
 ### 4.4 Start the Monitoring Agent
@@ -258,10 +258,10 @@ This section is **identical** to [Section 5 of the main README](README.md#5-lara
 
 ### 5.1 Install OpenTelemetry (Tracing)
 
-On each Laravel EC2, run as the app user (e.g., `theone`) in the Laravel project directory:
+On each Laravel EC2, run as the app user in the Laravel project directory:
 
 ```bash
-cd /home/theone/kol
+cd /data/sso-api
 
 # Core OpenTelemetry SDK + OTLP exporter
 composer require open-telemetry/sdk open-telemetry/exporter-otlp
@@ -280,10 +280,10 @@ php artisan vendor:publish --provider="Keepsuit\LaravelOpenTelemetry\LaravelOpen
 Append the OpenTelemetry settings to your Laravel `.env` file (reference: [`laravel/.env.otel.example`](laravel/.env.otel.example)):
 
 ```bash
-cat >> /home/theone/kol/.env << 'EOF'
+cat >> /data/sso-api/.env << 'EOF'
 
 # OpenTelemetry
-OTEL_SERVICE_NAME=duadualive-staging
+OTEL_SERVICE_NAME=sso-api-staging
 OTEL_TRACES_EXPORTER=otlp
 OTEL_METRICS_EXPORTER=none
 OTEL_LOGS_EXPORTER=none
@@ -298,13 +298,13 @@ EOF
 
 > **Notice**: `OTEL_EXPORTER_OTLP_ENDPOINT` still points to `http://localhost:4318` — this works because Alloy uses host networking. No change from the systemd approach.
 >
-> **Adjust** `OTEL_SERVICE_NAME` to a unique name per instance (e.g., `duadualive-staging`, `laravel-app-2`, etc.).
+> **Adjust** `OTEL_SERVICE_NAME` to a unique name per instance (e.g., `sso-api-staging`, `duadualive-staging`, etc.).
 
 ### 5.3 Install TraceId Middleware (Log ↔ Trace Correlation)
 
 ```bash
 # Copy the reference middleware (adjust the destination to your Laravel project path)
-cp laravel/TraceIdMiddleware.php /home/theone/kol/app/Http/Middleware/TraceIdMiddleware.php
+cp laravel/TraceIdMiddleware.php /data/sso-api/app/Http/Middleware/TraceIdMiddleware.php
 ```
 
 Register it in `bootstrap/app.php` (Laravel 11+):
@@ -506,10 +506,10 @@ From the LGTM server:
 
 ```bash
 # Query recent logs from this instance (adjust instance name to match your config)
-curl -s 'http://localhost:3100/loki/api/v1/query?query={instance="duadualive-staging"}&limit=5' | jq .
+curl -s 'http://localhost:3100/loki/api/v1/query?query={instance="sso-api-staging"}&limit=5' | jq .
 
 # Query metrics
-curl -s 'http://localhost:9009/prometheus/api/v1/query?query=up%7Binstance%3D%22duadualive-staging%22%7D' | jq .
+curl -s 'http://localhost:9009/prometheus/api/v1/query?query=up%7Binstance%3D%22sso-api-staging%22%7D' | jq .
 
 # Search for recent traces
 curl -s 'http://localhost:3200/api/search?limit=5' | jq .
@@ -517,8 +517,8 @@ curl -s 'http://localhost:3200/api/search?limit=5' | jq .
 
 Or verify in **Grafana UI** at `http://<LGTM-IP>:3000`:
 
-1. **Explore → Loki** → `{instance="duadualive-staging"}` → should see log entries
-2. **Explore → Mimir** → `up{instance="duadualive-staging"}` → should show `1`
+1. **Explore → Loki** → `{instance="sso-api-staging"}` → should see log entries
+2. **Explore → Mimir** → `up{instance="sso-api-staging"}` → should show `1`
 3. **Explore → Tempo** → Search → should see traces (after OpenTelemetry is configured)
 
 ### 8.5 End-to-End Smoke Test
@@ -527,7 +527,7 @@ Run this from the Laravel EC2:
 
 ```bash
 # Generate a test log entry (use sudo -u to match the Laravel app's file owner)
-sudo -u theone bash -c 'echo "['"$(date '+%Y-%m-%d %H:%M:%S')"'] production.ERROR: Docker smoke test from '"$(hostname)"'" >> /home/theone/kol/storage/logs/laravel.log'
+sudo -u someuser bash -c 'echo "['"$(date '+%Y-%m-%d %H:%M:%S')"'] production.ERROR: Docker smoke test from '"$(hostname)"'" >> /data/sso-api/storage/logs/laravel.log'
 
 # Generate a test trace (via OTLP HTTP)
 curl -X POST http://localhost:4318/v1/traces \
@@ -591,7 +591,7 @@ stage.timestamp {
 **Fix**: Use `sudo -u` to write as the app user:
 
 ```bash
-sudo -u theone bash -c 'echo "['"$(date '+%Y-%m-%d %H:%M:%S')"'] production.ERROR: Test" >> /home/theone/kol/storage/logs/laravel.log'
+sudo -u someuser bash -c 'echo "['"$(date '+%Y-%m-%d %H:%M:%S')"'] production.ERROR: Test" >> /data/sso-api/storage/logs/laravel.log'
 ```
 
 ### 9.3 Alloy Shows "component does not exist" for Nginx/PHP-FPM
@@ -609,7 +609,9 @@ cannot find the definition of component name "prometheus.exporter.php_fpm"
 
 ### 9.4 Backfilling Historical Logs
 
-By default, `tail_from_end = true` means Alloy only reads **new** log lines. To ingest historical logs:
+By default, `tail_from_end = true` means Alloy only reads **new** log lines. For the `sso-api-staging` setup, this is currently set to `false` to ingest past history logs. 
+
+To ingest historical logs:
 
 1. **On the LGTM server** — increase Loki's max age for old entries in `loki-config.yaml`:
 
